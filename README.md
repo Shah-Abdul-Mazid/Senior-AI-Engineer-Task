@@ -2,12 +2,13 @@
 **Senior AI Engineer Assignment — Production Implementation**
 
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg?style=flat&logo=fastapi)](https://fastapi.tiangolo.com)
+[![MongoDB](https://img.shields.io/badge/MongoDB%20Atlas-Cloud-47A248.svg?style=flat&logo=mongodb)](https://www.mongodb.com/)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16+-336791.svg?style=flat&logo=postgresql)](https://www.postgresql.org/)
 [![pgvector](https://img.shields.io/badge/pgvector-Vector%20Search-blue.svg)](https://github.com/pgvector/pgvector)
 [![React](https://img.shields.io/badge/React-18+-61DAFB.svg?style=flat&logo=react)](https://react.dev)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.6+-3178C6.svg?style=flat&logo=typescript)](https://www.typescriptlang.org/)
 [![Vite](https://img.shields.io/badge/Vite-6.0+-646CFF.svg?style=flat&logo=vite)](https://vitejs.dev/)
-[![Pytest](https://img.shields.io/badge/Tests-30%20Passed-brightgreen.svg)](https://docs.pytest.org/)
+[![Pytest](https://img.shields.io/badge/Tests-33%20Passed-brightgreen.svg)](https://docs.pytest.org/)
 
 ---
 
@@ -20,9 +21,9 @@ An enterprise-grade document intelligence platform designed to automate ingestio
 - **AI Structured Extraction (Task 2)**: Layout-aware extraction of invoice number, invoice date, supplier/customer entities, line items with quantities and unit prices, subtotal, tax, currency, and total amount with zero hallucinations (missing fields return `null`, not invented values).
 - **Data Validation & Invariants (Task 3)**: Automatic checks for missing mandatory fields, negative numbers, duplicate invoice numbers, line item sum consistency (supporting both net and gross listings), and tax arithmetic ($$Subtotal + Tax - Discount = Total$$). Flags records requiring manual review.
 - **Robust REST API & Async Workers (Task 4)**: FastAPI endpoints for multi-file upload, polling status, results retrieval, manual corrections (`PATCH`), cross-document verification, failed-job reprocessing (`POST /retry`), and bulk document cleanup (`DELETE /clear`).
-- **Database & Hybrid Search (Task 5)**: PostgreSQL relational schema storing metadata, line items, and audit logs with `pgvector` dense vector indexing for keyword, semantic, and hybrid search.
+- **Database & Hybrid Search (Task 5)**: Enterprise dual-database architecture: **MongoDB Atlas** storing complete document metadata, extracted OCR text, structured invoice results, validation errors, and processing history with full-text search indexes; plus **PostgreSQL** relational schema with `pgvector` dense vector indexing for keyword, semantic, and hybrid search.
 - **Clean React UI (Task 6)**: High-speed, focused dark-mode workspace for drag-and-drop uploads, queue management, visual invoice layout viewer, raw OCR layer inspection, validation alerts with inline correction editor, cross-document reconciliation (PDF vs PDF / PDF vs Excel), and Task 7 benchmark execution.
-- **Automated Testing & Benchmark Evaluation (Task 7)**: 30 automated unit and integration tests (100% passing) plus real benchmark evaluation across the 525-document dataset with measured accuracy and latency metrics.
+- **Automated Testing & Benchmark Evaluation (Task 7)**: 33 automated unit and integration tests (100% passing) plus real benchmark evaluation across the labeled dataset with measured accuracy and latency metrics.
 
 ---
 
@@ -161,6 +162,18 @@ erDiagram
     DOCUMENT ||--o{ VALIDATION_ERROR : "flags"
 ```
 
+### MongoDB Document Collections (Task 5)
+In addition to relational PostgreSQL tables, all document intelligence assets are stored in **MongoDB Atlas** across 4 collections:
+- `documents`: Document ID, filenames, file types, storage paths, file sizes, page/sheet counts, raw extracted OCR text, lifecycle statuses (`pending`, `processing`, `completed`, `requires_review`, `failed`), dense text embeddings (`vector(1536)`), and timestamps.
+- `invoices`: Document ID, invoice numbers, purchase order numbers, dates, vendor & customer entities, monetary amounts (subtotal, tax, discounts, total), currency, extraction confidence scores, and structured line item arrays.
+- `validation_errors`: Document ID, error types, severity levels (`error`, `warning`, `info`), field names, error messages, expected vs actual values, and resolution tracking.
+- `processing_history`: Complete pipeline audit trail recording stages (`queued`, `ocr_parsing`, `ai_extraction`, `validation`, `embedding`, `completed`), attempt counts, durations in ms, and error diagnostics.
+
+#### MongoDB Search & Indexing
+- **Full-Text & Keyword Search**: Text indexes on `raw_text`, `filename`, `invoice_number`, `purchase_order_number`, `supplier_name`, and `customer_name`. Supports exact identifier lookup, substring regex, and faceted filters.
+- **Semantic Vector Search**: Dense embedding cosine similarity matching against natural language queries (e.g., *"heavy machinery purchase order"*).
+- **Hybrid Search**: Weighted rank blending ($$0.4 \times \text{Keyword Score} + 0.6 \times \text{Semantic Score}$$).
+
 ---
 
 ## 🚀 Setup & Installation Instructions
@@ -231,8 +244,11 @@ backend/tests/test_documents_api.py::test_upload_invalid_extension PASSED [30%]
 backend/tests/test_documents_api.py::test_search_endpoint_contract PASSED [33%]
 backend/tests/test_documents_api.py::test_clear_documents_endpoint PASSED [36%]
 backend/tests/test_extraction.py::test_heuristic_extraction_fallback PASSED [40%]
-backend/tests/test_extraction.py::test_zero_hallucination_empty_text PASSED [43%]
-backend/tests/test_ocr.py::test_ocr_service_initialization         PASSED [46%]
+backend/tests/test_extraction.py::test_zero_hallucination_empty_text PASSED [39%]
+backend/tests/test_mongodb.py::test_mongodb_connection PASSED                    [42%]
+backend/tests/test_mongodb.py::test_mongodb_document_crud_and_history PASSED     [45%]
+backend/tests/test_mongodb.py::test_mongodb_keyword_and_semantic_search PASSED   [48%]
+backend/tests/test_ocr.py::test_ocr_service_initialization         PASSED [51%]
 backend/tests/test_ocr.py::test_ocr_extract_from_image             PASSED [50%]
 backend/tests/test_predict.py::test_health_endpoint                PASSED [53%]
 backend/tests/test_predict.py::test_predict_endpoint               PASSED [56%]
@@ -250,7 +266,7 @@ backend/tests/test_web.py::test_get_nonexistent_item               PASSED [93%]
 backend/tests/test_web.py::test_create_and_read_user               PASSED [96%]
 backend/tests/test_web.py::test_duplicate_user_email               PASSED [100%]
 
-==================== 30 passed in 1.66s ====================
+==================== 33 passed, 2 warnings in 31.47s ====================
 ```
 
 ---
