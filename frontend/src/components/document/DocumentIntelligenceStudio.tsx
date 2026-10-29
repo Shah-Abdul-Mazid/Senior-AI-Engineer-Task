@@ -928,6 +928,26 @@ export default function DocumentIntelligenceStudio({ onQueueCountChange }: Docum
                   </div>
                 </div>
 
+                {/* Export PAGE XML and ALTO XML */}
+                <div className="grid grid-cols-2 gap-2 pt-1">
+                  <a
+                    href={`http://localhost:8000/api/v1/documents/${selectedDocId}/page-xml`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="flex items-center justify-center gap-1.5 py-1.5 px-2 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 rounded-lg text-[10px] font-medium transition-all"
+                  >
+                    <FileText size={11} /> Export PAGE XML
+                  </a>
+                  <a
+                    href={`http://localhost:8000/api/v1/documents/${selectedDocId}/alto-xml`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="flex items-center justify-center gap-1.5 py-1.5 px-2 bg-sky-500/10 hover:bg-sky-500/20 text-sky-400 border border-sky-500/30 rounded-lg text-[10px] font-medium transition-all"
+                  >
+                    <Layers size={11} /> Export ALTO XML
+                  </a>
+                </div>
+
                 {/* Approve button */}
                 <Button
                   variant="primary" size="sm"

@@ -330,3 +330,67 @@ async def delete_document(
         "message": "Document deleted successfully",
         "document_id": str(document_id),
     }
+
+
+@router.get("/{document_id}/page-xml")
+async def get_document_page_xml(
+    document_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Generates and returns standard PRImA PAGE XML (2013-07-15) for a document.
+    Includes semantic entities: supplier, receiver, invoice_info, positions, and total.
+    """
+    from fastapi.responses import Response
+    from app.services.xml_service import xml_service
+    from app.models.invoice import Invoice
+    from app.models.line_item import LineItem
+
+    doc = await db.get(Document, document_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    inv_stmt = select(Invoice).where(Invoice.document_id == document_id)
+    inv = (await db.execute(inv_stmt)).scalar_one_or_none()
+
+    items = []
+    if inv:
+        item_stmt = select(LineItem).where(LineItem.invoice_id == inv.id)
+        items = (await db.execute(item_stmt)).scalars().all()
+
+    xml_content = xml_service.generate_page_xml(doc, inv, items)
+    filename = f"{os.path.splitext(doc.original_filename or 'document')[0]}_page.xml"
+    return Response(
+        content=xml_content,
+        media_type="application/xml",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/{document_id}/alto-xml")
+async def get_document_alto_xml(
+    document_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Generates and returns standard Library of Congress ALTO XML v4 for a document.
+    Includes OCR-recognized words, lines, and bounding boxes.
+    """
+    from fastapi.responses import Response
+    from app.services.xml_service import xml_service
+    from app.models.invoice import Invoice
+
+    doc = await db.get(Document, document_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    inv_stmt = select(Invoice).where(Invoice.document_id == document_id)
+    inv = (await db.execute(inv_stmt)).scalar_one_or_none()
+
+    xml_content = xml_service.generate_alto_xml(doc, inv)
+    filename = f"{os.path.splitext(doc.original_filename or 'document')[0]}_alto.xml"
+    return Response(
+        content=xml_content,
+        media_type="application/xml",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

@@ -222,23 +222,52 @@ class LayoutAwareExtractor:
         inv_date = self._parse_flexible_date(text)
 
         # 3. Currency & Amounts (Search Sub total, Total, or Amount anywhere)
-        subtotal = self._extract_specific_amount(text, r"(?:subtotal|sub-total|sub\s*total|net\s*amount|net\s*total|net\s*worth)")
-        tax = self._extract_specific_amount(text, r"(?:tax|vat|gst|sales\s*tax)")
-        total, currency = self._extract_amount_and_currency(text)
+        subtotal, tax, total = self._extract_summary_amounts(text)
+        currency = "USD"
+        if "£" in text or "GBP" in text:
+            currency = "GBP"
+        elif "€" in text or "EUR" in text:
+            currency = "EUR"
 
-        # Math reconcilation if subtotal was found and total was missing
-        if total is None and subtotal is not None:
+        if total is None:
+            total, curr_found = self._extract_amount_and_currency(text)
+            if curr_found:
+                currency = curr_found
+
+        if subtotal is None:
+            subtotal = self._extract_specific_amount(text, r"(?:subtotal|sub-total|sub\s*total|net\s*amount|net\s*total|net\s*worth)")
+
+        if tax is None:
+            tax = self._extract_specific_amount(text, r"(?:tax|vat|gst|sales\s*tax)")
+
+        # Math reconcilation and consistency check
+        if total is not None and subtotal is not None and tax is not None:
+            if abs(round(subtotal + tax, 2) - total) > 0.05 and total < subtotal:
+                total = round(subtotal + tax, 2)
+        elif total is None and subtotal is not None:
             total = round(subtotal + (tax or 0.0), 2)
         elif subtotal is None and total is not None:
             subtotal = round(total - (tax or 0.0), 2)
 
-        # 4. Supplier / Vendor Identification
+        # 4. Supplier / Vendor & Customer Identification
         supplier_name = None
-        m_seller = re.search(r"(?:seller|vendor|supplier|from)[:\s.]*\n?([^\n\r,]+)", text, re.IGNORECASE)
-        if m_seller:
-            cand = m_seller.group(1).strip()
-            if len(cand) > 2 and not any(k in cand.lower() for k in ["client", "buyer", "customer", "bill to", "tax"]):
-                supplier_name = cand
+        customer_name = None
+
+        # Check two-column Seller / Client layout
+        for i, line in enumerate(lines[:10]):
+            if re.match(r"^seller:?$", line, re.IGNORECASE) and i + 1 < len(lines) and re.match(r"^(?:client|buyer|customer):?$", lines[i+1], re.IGNORECASE):
+                if i + 2 < len(lines):
+                    supplier_name = self._clean_name(lines[i+2])
+                if i + 3 < len(lines):
+                    customer_name = self._clean_name(lines[i+3])
+                break
+
+        if not supplier_name:
+            m_seller = re.search(r"(?:seller|vendor|supplier|from)[:\s.]*\n?([^\n\r,]+)", text, re.IGNORECASE)
+            if m_seller:
+                cand = self._clean_name(m_seller.group(1))
+                if cand and len(cand) > 2 and not any(k in cand.lower() for k in ["client", "buyer", "customer", "bill to", "tax"]):
+                    supplier_name = cand
 
         if not supplier_name:
             for line in lines[:8]:
@@ -249,16 +278,17 @@ class LayoutAwareExtractor:
                     continue
                 if len(clean_l) > 3:
                     match = re.search(r"^(.*?)(?:,\s*[0-9]+|Street|Road|House|Ave|Tel|VAT|Tax)", clean_l, re.IGNORECASE)
-                    supplier_name = match.group(1).strip() if match else clean_l[:120].strip()
+                    supplier_name = self._clean_name(match.group(1) if match else clean_l[:120])
                     break
 
         # 5. Customer / Receiver Identification
-        customer_name = None
-        m_cust = re.search(r"(?:bill\s*to|sold\s*to|customer|client|buyer|messrs)[:\s.]*\n?([^\n\r,]+)", text, re.IGNORECASE)
-        if m_cust:
-            cand = m_cust.group(1).strip()
-            if len(cand) > 2 and not any(k in cand.lower() for k in ["seller", "supplier", "vendor", "tax"]):
-                customer_name = cand
+        if not customer_name:
+            m_cust = re.search(r"(?:bill\s*to|sold\s*to|customer|client|buyer|messrs)[:\s.]*\n?([^\n\r,]+)", text, re.IGNORECASE)
+            if m_cust:
+                cand = self._clean_name(m_cust.group(1))
+                if cand and len(cand) > 2 and not any(k in cand.lower() for k in ["seller", "supplier", "vendor", "tax"]):
+                    if not (supplier_name and cand.lower().startswith(supplier_name.lower()[:5])):
+                        customer_name = cand
 
         # Company name detection (Inc., Corp., Ltd., Co.) in the first 25 lines (e.g. R.J. Reynolds Tobacco Co.)
         if not customer_name:
@@ -270,13 +300,12 @@ class LayoutAwareExtractor:
             for ln in lines[1:25]:
                 cm = company_pat.match(ln)
                 if cm:
-                    cand = cm.group(1).strip(" ._-*#")
-                    cand = re.sub(r"\.\.+", ".", cand).strip()
-                    # Skip if same as supplier
-                    if supplier_name and cand.lower().startswith(supplier_name.lower()[:6]):
+                    cand = self._clean_name(cm.group(1))
+                    if supplier_name and cand and cand.lower().startswith(supplier_name.lower()[:5]):
                         continue
-                    customer_name = cand[:80].strip()
-                    break
+                    if cand:
+                        customer_name = cand[:80].strip()
+                        break
 
         # Fallback for Purchase Order documents: buyer/receiver after "Attention:" or "Ship To:" or "Deliver To:"
         if not customer_name:
@@ -285,9 +314,8 @@ class LayoutAwareExtractor:
                 text, re.IGNORECASE | re.DOTALL,
             )
             if m_attn:
-                cand = m_attn.group(1).strip()
-                cand = cand.split("\n")[0].strip()
-                if len(cand) > 3 and not any(k in cand.lower() for k in ["seller", "supplier", "vendor", "tax", "invoice", "date"]):
+                cand = self._clean_name(m_attn.group(1).split("\n")[0])
+                if cand and len(cand) > 3 and not any(k in cand.lower() for k in ["seller", "supplier", "vendor", "tax", "invoice", "date"]):
                     customer_name = cand[:80].strip()
 
         # 6. Extract Line Items Table
@@ -621,19 +649,168 @@ class LayoutAwareExtractor:
             return self._parse_amount_value(m.group(1))
         return None
 
+    def _clean_name(self, s: Optional[str]) -> Optional[str]:
+        if not s:
+            return None
+        s = re.sub(r"^[^a-zA-Z0-9]+", "", s)
+        s = re.sub(r"([a-z])([A-Z])", r"\1 \2", s)
+        s = re.sub(r"([a-zA-Z]+?)and([A-Z][a-zA-Z]+)", r"\1 and \2", s)
+        s = re.sub(r",([^\s])", r", \1", s)
+        return s.strip(" ._-*#")
+
+    def _extract_summary_amounts(self, text: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """
+        Extracts (subtotal, tax, total) from summary blocks, total rows, and VAT breakdowns.
+        Handles multi-column summary tables (Net worth, VAT, Gross worth).
+        """
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        subtotal = None
+        tax = None
+        total = None
+
+        summary_idx = -1
+        for i, l in enumerate(lines):
+            if re.search(r"\b(?:summary|totals?|gross\s*worth|amount\s*due)\b", l, re.IGNORECASE):
+                summary_idx = i
+                break
+
+        search_lines = lines[summary_idx:] if summary_idx != -1 else lines
+
+        all_summary_amounts = []
+        for l in search_lines:
+            nums = re.findall(r"(?:US[#$]|[$€£¥])?\s*([0-9]+(?:[.,][0-9]{3})*[.,][0-9]{2})", l)
+            for n in nums:
+                v = self._parse_amount_value(n)
+                if v is not None and v > 0:
+                    all_summary_amounts.append(v)
+
+        # Look for triplet where a + b == c (Subtotal + Tax = Total)
+        if len(all_summary_amounts) >= 3:
+            for i in range(len(all_summary_amounts) - 2):
+                a, b, c = all_summary_amounts[i], all_summary_amounts[i+1], all_summary_amounts[i+2]
+                if abs(round(a + b, 2) - round(c, 2)) < 0.05:
+                    return round(a, 2), round(b, 2), round(c, 2)
+
+        for l in lines:
+            if re.search(r"\b(?:subtotal|sub\s*total|net\s*worth|net\s*amount)\b", l, re.IGNORECASE):
+                m = re.findall(r"([0-9]+(?:[.,][0-9]{3})*[.,][0-9]{2})", l)
+                if m:
+                    subtotal = self._parse_amount_value(m[-1])
+            if re.search(r"\b(?:tax|vat|gst)\b(?!\s*\[)", l, re.IGNORECASE):
+                m = re.findall(r"([0-9]+(?:[.,][0-9]{3})*[.,][0-9]{2})", l)
+                if m:
+                    tax = self._parse_amount_value(m[-1])
+            if re.search(r"\b(?:grand\s*total|total\s*amount|total\s*due|amount\s*due|gross\s*worth|total)\b", l, re.IGNORECASE):
+                m = re.findall(r"([0-9]+(?:[.,][0-9]{3})*[.,][0-9]{2})", l)
+                if m:
+                    total = self._parse_amount_value(m[-1])
+
+        if subtotal and tax and not total:
+            total = round(subtotal + tax, 2)
+        elif total and subtotal and not tax:
+            tax = round(total - subtotal, 2) if total >= subtotal else 0.0
+        elif total and not subtotal:
+            subtotal = round(total - (tax or 0.0), 2)
+
+        return subtotal, tax, total
+
     def _extract_table_rows(self, text: str, total: Optional[float]) -> List[LineItemSchema]:
-        """Extracts row entries from tabular structures or synthesizes position line."""
-        items = []
-        # Look for lines with price/amount at end
-        for line in text.splitlines():
-            line = line.strip()
-            row_match = re.search(r"^(.*?)\s+([0-9]+(?:\.[0-9]+)?)\s+([0-9,]+\.[0-9]{2})\s+([0-9,]+\.[0-9]{2})$", line)
+        """Extracts row entries from tabular structures (single-line or multi-line cell blocks) or synthesizes position line."""
+        items: List[LineItemSchema] = []
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+        # 1. Single-line row parser: e.g. "Description 3.00 10.99 32.97" or "Description 3,00 10,99 32,97"
+        for line in lines:
+            row_match = re.search(r"^(.*?)\s+([0-9]+(?:[.,][0-9]+)?)\s+([0-9]+(?:[.,][0-9]{3})*[.,][0-9]{2})\s+([0-9]+(?:[.,][0-9]{3})*[.,][0-9]{2})$", line)
             if row_match:
-                desc = row_match.group(1).strip()
-                qty = float(row_match.group(2))
-                unit_p = float(row_match.group(3).replace(",", ""))
-                amt = float(row_match.group(4).replace(",", ""))
-                items.append(LineItemSchema(description=desc, quantity=qty, unit_price=unit_p, amount=amt))
+                desc = row_match.group(1).strip(" 1234567890.-#")
+                qty = self._parse_amount_value(row_match.group(2)) or 1.0
+                unit_p = self._parse_amount_value(row_match.group(3)) or 0.0
+                amt = self._parse_amount_value(row_match.group(4)) or 0.0
+                if len(desc) > 2 and amt > 0:
+                    items.append(LineItemSchema(description=desc, quantity=qty, unit_price=unit_p, amount=amt))
+
+        if items:
+            return items
+
+        # 2. Block/Multi-line item parser (e.g. OCR vertical cell output under ITEMS heading)
+        items_idx = -1
+        summary_idx = -1
+        for i, l in enumerate(lines):
+            if re.match(r"^items?\b", l, re.IGNORECASE) and items_idx == -1:
+                items_idx = i
+            elif re.match(r"^(?:summary|totals?|subtotal)\b", l, re.IGNORECASE) and summary_idx == -1 and items_idx != -1:
+                summary_idx = i
+
+        if items_idx != -1:
+            end_idx = summary_idx if summary_idx != -1 else len(lines)
+            item_lines = lines[items_idx+1:end_idx]
+
+            item_blocks = []
+            curr_block = []
+            in_items = False
+
+            for l in item_lines:
+                if re.match(r"^[0-9]{1,3}\.?$", l):
+                    in_items = True
+                    if curr_block:
+                        item_blocks.append(curr_block)
+                    curr_block = [l]
+                elif in_items:
+                    curr_block.append(l)
+            if curr_block:
+                item_blocks.append(curr_block)
+
+            for blk in item_blocks:
+                desc_parts = []
+                nums = []
+                for tok in blk[1:]:
+                    if "%" in tok or tok.lower() in ["each", "pcs", "pc", "unit", "box", "kg", "m", "hours", "ea"]:
+                        continue
+                    m_dec = re.match(r"^([0-9]+(?:[.,][0-9]{3})*[.,][0-9]{2})$", tok)
+                    if m_dec:
+                        val = self._parse_amount_value(m_dec.group(1))
+                        if val is not None:
+                            nums.append(val)
+                    else:
+                        desc_parts.append(tok)
+
+                qty = 1.0
+                unit_p = 0.0
+                amt = 0.0
+
+                if len(nums) >= 3:
+                    matched = False
+                    for qi in range(len(nums)):
+                        for pi in range(len(nums)):
+                            if qi == pi: continue
+                            for ai in range(len(nums)):
+                                if ai in [qi, pi]: continue
+                                if abs(round(nums[qi] * nums[pi], 2) - round(nums[ai], 2)) < 0.05:
+                                    qty, unit_p, amt = nums[qi], nums[pi], nums[ai]
+                                    matched = True
+                                    break
+                            if matched: break
+                        if matched: break
+                    if not matched:
+                        qty, unit_p, amt = nums[0], nums[1], nums[2]
+                elif len(nums) == 2:
+                    qty, amt = nums[0], nums[1]
+                    unit_p = round(amt / qty, 2) if qty > 0 else amt
+                elif len(nums) == 1:
+                    amt = unit_p = nums[0]
+
+                clean_desc = " ".join(desc_parts).strip()
+                clean_desc = re.sub(r"([a-z])([A-Z])", r"\1 \2", clean_desc)
+                clean_desc = re.sub(r"([0-9])([A-Z])", r"\1 \2", clean_desc)
+
+                if amt > 0:
+                    items.append(LineItemSchema(
+                        description=clean_desc or "Item position",
+                        quantity=qty,
+                        unit_price=unit_p,
+                        amount=amt
+                    ))
 
         if not items and total:
             items.append(
