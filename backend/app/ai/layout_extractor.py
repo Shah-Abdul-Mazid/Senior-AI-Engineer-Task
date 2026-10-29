@@ -124,7 +124,12 @@ class LayoutAwareExtractor:
         po_num = (
             self._extract_purchase_order_number(info_raw)
             or self._extract_purchase_order_number(full_text)
+            or self._extract_purchase_order_number(positions_raw)
         )
+
+        # Fallback: If no explicit invoice number exists but purchase order number is found, use it
+        if not inv_num and po_num:
+            inv_num = po_num
 
         # Clean Date from info block, general header, or full text
         inv_date = (
@@ -208,6 +213,8 @@ class LayoutAwareExtractor:
         # 1. Invoice Number & Purchase Order Number
         inv_num = self._extract_invoice_number(text)
         po_num = self._extract_purchase_order_number(text)
+        if not inv_num and po_num:
+            inv_num = po_num
 
         # 2. Invoice Date
         inv_date = self._parse_flexible_date(text)
@@ -225,22 +232,62 @@ class LayoutAwareExtractor:
 
         # 4. Supplier / Vendor Identification
         supplier_name = None
-        for line in lines[:8]:
-            clean_l = re.sub(r"^[^a-zA-Z0-9]+", "", line).strip()
-            # Skip labels like 'INVOICE', 'DATE'
-            if any(k in clean_l.lower() for k in ["invoice", "estimate report", "statement", "page "]):
-                continue
-            if len(clean_l) > 3:
-                # Truncate at address or phone
-                match = re.search(r"^(.*?)(?:,\s*[0-9]+|Street|Road|House|Ave|Tel|VAT|Tax)", clean_l, re.IGNORECASE)
-                supplier_name = match.group(1).strip() if match else clean_l[:120].strip()
-                break
+        m_seller = re.search(r"(?:seller|vendor|supplier|from)[:\s.]*\n?([^\n\r,]+)", text, re.IGNORECASE)
+        if m_seller:
+            cand = m_seller.group(1).strip()
+            if len(cand) > 2 and not any(k in cand.lower() for k in ["client", "buyer", "customer", "bill to", "tax"]):
+                supplier_name = cand
+
+        if not supplier_name:
+            for line in lines[:8]:
+                clean_l = re.sub(r"^[^a-zA-Z0-9]+", "", line).strip()
+                if re.search(r"^\d{1,4}[-./]\d{1,2}[-./]\d{2,4}$", clean_l):
+                    continue
+                if any(k in clean_l.lower() for k in ["invoice", "estimate report", "statement", "page ", "date", "seller", "client", "buyer", "customer", "tax"]):
+                    continue
+                if len(clean_l) > 3:
+                    match = re.search(r"^(.*?)(?:,\s*[0-9]+|Street|Road|House|Ave|Tel|VAT|Tax)", clean_l, re.IGNORECASE)
+                    supplier_name = match.group(1).strip() if match else clean_l[:120].strip()
+                    break
 
         # 5. Customer / Receiver Identification
         customer_name = None
-        m_cust = re.search(r"(?:bill\s*to|sold\s*to|customer|client|messrs)[:\s.]*([^\n\r,]+)", text, re.IGNORECASE)
+        m_cust = re.search(r"(?:bill\s*to|sold\s*to|customer|client|buyer|messrs)[:\s.]*\n?([^\n\r,]+)", text, re.IGNORECASE)
         if m_cust:
-            customer_name = m_cust.group(1).strip()
+            cand = m_cust.group(1).strip()
+            if len(cand) > 2 and not any(k in cand.lower() for k in ["seller", "supplier", "vendor", "tax"]):
+                customer_name = cand
+
+        # For Purchase Order documents: buyer/receiver may be after "Attention:" or "Ship To:" or "Deliver To:"
+        if not customer_name:
+            m_attn = re.search(
+                r"(?:attention|attn|ship\s*to|deliver(?:y)?\s*to|consignee|receiver|received\s*by)[:\s.]*\n?([^\n\r,]{4,80})",
+                text, re.IGNORECASE | re.DOTALL,
+            )
+            if m_attn:
+                cand = m_attn.group(1).strip()
+                # Clean up any inline noise like phone/date tokens
+                cand = cand.split("\n")[0].strip()
+                if len(cand) > 3 and not any(k in cand.lower() for k in ["seller", "supplier", "vendor", "tax", "invoice", "date"]):
+                    customer_name = cand[:80].strip()
+
+        # For Purchase Order docs: buyer name may appear after the PO heading block — detect "R.J. Reynolds" style company
+        if not customer_name:
+            # Match lines that look like company names (Inc., Corp., Ltd., Co.) in the first 25 lines
+            company_pat = re.compile(
+                r"^(?!.*(?:invoice|purchase order|statement|page\s*\d|viro|vendor|seller|supplier))"  # not a header line
+                r"(.{3,60}(?:\bInc\.?|\bCorp\.?|\bLtd\.?|\bCo\.?|\bLLC|\bPLC|\bGmbH|\bS\.A\.).*)",
+                re.IGNORECASE,
+            )
+            for ln in lines[1:25]:
+                cm = company_pat.match(ln)
+                if cm:
+                    cand = cm.group(1).strip()
+                    # Skip if same as supplier
+                    if supplier_name and cand.lower().startswith(supplier_name.lower()[:8]):
+                        continue
+                    customer_name = cand[:80].strip()
+                    break
 
         # 6. Extract Line Items Table
         line_items = self._extract_table_rows(text, total)
@@ -270,16 +317,35 @@ class LayoutAwareExtractor:
             extraction_notes="Extracted using multi-format layout parser convention.",
         )
 
+    def _is_phone_number(self, cand: str, full_text: str = "") -> bool:
+        """Determines if a candidate string is a telephone or fax number rather than a document ID."""
+        if not cand:
+            return False
+        c = cand.strip(" .:-_/#~^[]")
+        # 7, 10 or 11 digits standard telephone format (e.g. 301-770-2100, (301) 770-2100, 1-800-555-0199)
+        digits_only = re.sub(r"\D", "", c)
+        if len(digits_only) in [7, 10, 11] and re.match(r"^(\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}$", c):
+            return True
+        if full_text and len(c) >= 3:
+            # Check if explicitly labeled as phone/fax/tel in text
+            if re.search(r"(?:tel|telephone|phone|fax|mobile|call)\s*[:.\s#]*" + re.escape(c) + r"\b", full_text, re.IGNORECASE):
+                return True
+        return False
+
     def _extract_invoice_number(self, text: Optional[str]) -> Optional[str]:
         """
         Extracts invoice number or fallback reference identifier across all conventions:
         - invoice no, inv. no, invoice number, invoice #
-        - purchase order no, order no, p.o. no
+        - purchase order no, order no, p.o. no, contract no
         - serial number, serial no, s/n
         - ref no, reference no, job no, bill no, voucher no
+        Filters out phone numbers and metadata noise.
         """
         if not text:
             return None
+        clean_text = re.sub(r"[\u2018\u2019`]", "'", text)
+        clean_text = re.sub(r"([A-Z0-9])\s*-\s*([A-Z0-9])", r"\1-\2", clean_text)
+
         stop_words = {
             "details", "date", "page", "pace", "point", "tax", "due", "no",
             "information", "info", "data", "copy", "receipt", "statement",
@@ -288,28 +354,34 @@ class LayoutAwareExtractor:
 
         # Tier 1: Explicit Invoice Number indicators (INVOICE NO, INV. NO, INVOICE #, etc.)
         priority1_patterns = [
-            r"(?:invoice|inv|facture|rechnung)\s*(?:\.?\s*no\.+|no\.?|number|numbe?r?|#|id|code|:)\s*[:\s.]*([A-Z0-9][A-Z0-9\-_ /]{1,25})",
+            r"(?:invoice|inv|facture|rechnung)\s*(?:\.?\s*['\"`]?\s*no\.+|['\"`]?\s*no\.?|number|numbe?r?|#|id|code|:)\s*[:\s.]*([A-Z0-9][A-Z0-9\-_ /]{0,25})",
             r"\b(?:invoice|inv)\.?:?\s*#\s*([A-Z0-9\-_ /]+)",
             r"\b(?:invoice|inv)\.?\s*[:\s]+([0-9][A-Z0-9\-_ /]{1,25})",
         ]
         for pat in priority1_patterns:
-            m = re.search(pat, text, re.IGNORECASE)
+            m = re.search(pat, clean_text, re.IGNORECASE)
             if m:
-                cand = m.group(1).strip(" .:-_/#")
-                cand = re.split(r"\s+(?:date|tax|due|point|customer|to|page|ref|order)\b", cand, flags=re.IGNORECASE)[0].strip(" .:-_/#")
-                if len(cand) >= 2 and cand.lower() not in stop_words:
+                cand = m.group(1).strip(" .:-_/#~^")
+                cand = re.split(r"\s+(?:date|tax|due|point|customer|to|page|ref|order|po\b|purchase|tel|telephone|phone)\b", cand, flags=re.IGNORECASE)[0].strip(" .:-_/#~^")
+                if len(cand) >= 1 and cand.lower() not in stop_words and not self._is_phone_number(cand, clean_text):
                     return cand
 
-        # Tier 2: Purchase Order No / Order No (fallback if no explicit invoice number)
+        # Tier 2: Purchase Order No / Order No / Contract No (fallback if no explicit invoice number)
         priority2_patterns = [
-            r"(?:purchase\s*order|p\.?o\.?|order)\s*(?:\.?\s*no\.+|no\.?|number|numbe?r?|#|id|code|:)\s*[:\s.]*([A-Z0-9][A-Z0-9\-_ /]{1,25})",
+            r"[\[I|]?Contract\s*(?:No\.?|#|:)\s*([A-Z0-9][A-Z0-9\-_ /~^]{2,25})",
+            r"(?:purchase\s*order|p\.?o\.?\s*order|p\.?o\.?)\s*(?:\.?\s*['\"`]?\s*no\.+|['\"`]?\s*no\.?|number|numbe?r?|#|id|code|:)\s*[:\s.]*([A-Z0-9][A-Z0-9\-_ /]{0,25})",
+            r"\b(?:p\.?o\.?|po)\s*#\s*([A-Z0-9\-_ /~^]+)",
+            r"(?:contract|order|agreement)\s*(?:\.?\s*['\"`]?\s*no\.+|['\"`]?\s*no\.?|number|numbe?r?|#|id|code|:)\s*[:\s.]*([A-Z0-9][A-Z0-9\-_ /]{0,25})",
+            r"\[Contract\s*No\.?\s*([A-Z0-9\-_ /]+)\]",
         ]
         for pat in priority2_patterns:
-            m = re.search(pat, text, re.IGNORECASE)
+            m = re.search(pat, clean_text, re.IGNORECASE)
             if m:
-                cand = m.group(1).strip(" .:-_/#")
-                cand = re.split(r"\s+(?:date|tax|due|point|customer|to|page|ref|bli)\b", cand, flags=re.IGNORECASE)[0].strip(" .:-_/#")
-                if len(cand) >= 2 and cand.lower() not in stop_words:
+                cand = m.group(1).strip(" .:-_/#~^[]")
+                cand = re.split(r"\s+(?:date|tax|due|point|customer|to|page|ref|bli|invoice|tel|telephone|phone)\b", cand, flags=re.IGNORECASE)[0].strip(" .:-_/#~^[]")
+                if len(cand) == 1 and cand.isalpha():
+                    continue
+                if len(cand) >= 1 and cand.lower() not in stop_words and not self._is_phone_number(cand, clean_text):
                     return cand
 
         # Tier 3: Serial Number / S/N / Ser No
@@ -317,36 +389,37 @@ class LayoutAwareExtractor:
             r"(?:serial\s*number|serial\s*no\.?|ser\.?\s*no\.?|s/?n\.?|serial\s*#)\s*[:\s.]*([A-Z0-9][A-Z0-9\-_ /]{1,25})",
         ]
         for pat in priority3_patterns:
-            m = re.search(pat, text, re.IGNORECASE)
+            m = re.search(pat, clean_text, re.IGNORECASE)
             if m:
                 cand = m.group(1).strip(" .:-_/#")
-                if len(cand) >= 2 and cand.lower() not in stop_words:
+                if len(cand) >= 2 and cand.lower() not in stop_words and not self._is_phone_number(cand, clean_text):
                     return cand
 
         # Tier 4: Ref No / Job No / Bill No / Voucher No / OCR noisy distortions
         priority4_patterns = [
-            r"(?:reference|ref|job|bill|voucher|bli\s*ref)\s*(?:\.?\s*no\.+|no\.?|number|#|code|id|:)\s*[:\s.]*([A-Z0-9][A-Z0-9\-_ /]{1,25})",
+            r"(?:reference|ref|job|bill|voucher|bli\s*ref)\s*(?:\.?\s*['\"`]?\s*no\.+|['\"`]?\s*no\.?|number|#|code|id|:)\s*[:\s.]*([A-Z0-9][A-Z0-9\-_ /]{1,25})",
             r"(?:8111|tiu\s*huhetk|huhetk|1nv01ce)\s*(?:number|no\.+|#|:)\s*[:\s.]*([A-Z0-9][A-Z0-9\-_ /]{1,25})",
         ]
         for pat in priority4_patterns:
-            m = re.search(pat, text, re.IGNORECASE)
+            m = re.search(pat, clean_text, re.IGNORECASE)
             if m:
                 cand = m.group(1).strip(" .:-_/#")
-                cand = re.split(r"\s+(?:date|tax|due|point|customer|to|page)\b", cand, flags=re.IGNORECASE)[0].strip(" .:-_/#")
-                if len(cand) >= 2 and cand.lower() not in stop_words:
+                cand = re.split(r"\s+(?:date|tax|due|point|customer|to|page|tel|telephone|phone)\b", cand, flags=re.IGNORECASE)[0].strip(" .:-_/#")
+                if len(cand) >= 2 and cand.lower() not in stop_words and not self._is_phone_number(cand, clean_text):
                     return cand
 
         # Tier 5: Standalone structured codes (e.g. 1575-3, P-02-093A, V-10-U970)
+        # Note: Must NEVER match standard telephone numbers (e.g. 301-770-2100)
         priority5_patterns = [
-            r"\b([A-Z0-9]{1,4}-[A-Z0-9]{1,4}-[A-Z0-9]{2,6})\b",
+            r"\b([A-Z]{1,4}-[A-Z0-9]{1,4}-[A-Z0-9]{2,6})\b",
             r"\b([0-9]{3,6}-[0-9]{1,4})\b",
             r"\b([A-Z]{1,3}[0-9]{4,8})\b",
         ]
         for pat in priority5_patterns:
-            m = re.search(pat, text)
+            m = re.search(pat, clean_text)
             if m:
                 cand = m.group(1).strip()
-                if cand.lower() not in stop_words:
+                if cand.lower() not in stop_words and not self._is_phone_number(cand, clean_text):
                     return cand
         return None
 
@@ -354,23 +427,37 @@ class LayoutAwareExtractor:
         """Extracts purchase order or order reference number."""
         if not text:
             return None
+        clean_text = re.sub(r"[\u2018\u2019`]", "'", text)
+        clean_text = re.sub(r"([A-Z0-9])\s*-\s*([A-Z0-9])", r"\1-\2", clean_text)
         patterns = [
-            r"(?:purchase\s*order|p\.?o\.?)\s*(?:\.?\s*no\.+|no\.?|number|#|numbe?r?|code|id|:)\s*[:\s.]*([A-Z0-9][A-Z0-9\-_ /~^]{1,25})",
+            r"[\[I|]?Contract\s*(?:No\.?|#|:)\s*([A-Z0-9][A-Z0-9\-_ /~^]{2,25})",
+            r"(?:purchase\s*order|p\.?o\.?\s*order|p\.?o\.?)\s*(?:\.?\s*['\"`]?\s*no\.+|['\"`]?\s*no\.?|number|#|numbe?r?|code|id|:)\s*[:\s.]*([A-Z0-9][A-Z0-9\-_ /~^]{0,25})",
             r"\b(?:p\.?o\.?|po)\s*#\s*([A-Z0-9\-_ /~^]+)",
+            r"(?:contract|agreement|order)\s*(?:\.?\s*['\"`]?\s*no\.+|['\"`]?\s*no\.?|number|#|code|id|:)\s*[:\s.]*([A-Z0-9][A-Z0-9\-_ /~^]{0,25})",
+            r"\[Contract\s*No\.?\s*([A-Z0-9\-_ /]+)\]",
         ]
+        stop_words = {
+            "details", "date", "page", "pace", "point", "tax", "due", "no",
+            "information", "info", "data", "copy", "receipt", "statement",
+            "for", "to", "from", "report", "code"
+        }
         for pat in patterns:
-            m = re.search(pat, text, re.IGNORECASE)
+            m = re.search(pat, clean_text, re.IGNORECASE)
             if m:
-                cand = m.group(1).strip(" .:-_/#~^")
-                cand = re.split(r"\s+(?:date|tax|due|point|customer|to|page|ref|bli|invoice)\b", cand, flags=re.IGNORECASE)[0].strip(" .:-_/#~^")
-                if len(cand) >= 2:
+                cand = m.group(1).strip(" .:-_/#~^[]")
+                cand = re.split(r"\s+(?:date|tax|due|point|customer|to|page|ref|bli|invoice|tel|telephone|phone)\b", cand, flags=re.IGNORECASE)[0].strip(" .:-_/#~^[]")
+                if len(cand) == 1 and cand.isalpha():
+                    continue
+                if len(cand) >= 1 and cand.lower() not in stop_words and not self._is_phone_number(cand, clean_text):
                     return cand
         return None
 
     def _parse_flexible_date(self, text: Optional[str]) -> Optional[date]:
-        """Parses dates across ISO (2026-10-15), US (10/15/2026), Scanned (26.5.02, 26/5/1982), Alpha (APR21/79, OCT 17/79), and Full Month (January 28, 1983)."""
+        """Parses dates across ISO (2026-10-15), US (10/15/2026), Scanned (26.5.02, 26/5/1982), Alpha (APR21/79, OCT 17/79), and Full Month (January 28, 1983, May 9, 1975)."""
         if not text:
             return None
+
+        clean = re.sub(r"[\u2018\u2019`]", "'", text)
 
         months_map = {
             "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
@@ -378,8 +465,8 @@ class LayoutAwareExtractor:
             "cct": 10, "aus": 8, "octo": 10
         }
 
-        # 1. Full/Alpha Month format: January 28, 1983, March 12, 1984, APR21/79, OCT 17/79, CCT 17/79
-        m_alpha = re.search(r"\b([A-Za-z]{3,10})\s*([0-9]{1,2})[,\s/-]+([0-9]{2,4})\b", text, re.IGNORECASE)
+        # 1. Full/Alpha Month format: January 28, 1983, May 9, 1975, May 9,'1975, APR21/79, OCT 17/79
+        m_alpha = re.search(r"([A-Za-z]{3,10})[.\s,/-]*([0-9]{1,2})[.\s,'\"/\\-]+([0-9]{2,4})", clean, re.IGNORECASE)
         if m_alpha and m_alpha.group(1).lower()[:3] in months_map:
             mon = months_map[m_alpha.group(1).lower()[:3]]
             day = int(m_alpha.group(2))
@@ -390,10 +477,10 @@ class LayoutAwareExtractor:
             except ValueError:
                 pass
 
-        clean = re.sub(r"(\d)\s+(\d)", r"\1\2", text)
+        clean_num = re.sub(r"(\d)\s+(\d)", r"\1\2", clean)
 
         # 2. DD-MONTH-YY format: 26-MAY-02, 26.5.02
-        m_alpha2 = re.search(r"\b([0-9]{1,2})[\s,/-]+([A-Za-z]{3,10})[\s,/-]+([0-9]{2,4})\b", clean, re.IGNORECASE)
+        m_alpha2 = re.search(r"\b([0-9]{1,2})[\s,/-]+([A-Za-z]{3,10})[\s,/-]+([0-9]{2,4})\b", clean_num, re.IGNORECASE)
         if m_alpha2 and m_alpha2.group(2).lower()[:3] in months_map:
             day = int(m_alpha2.group(1))
             mon = months_map[m_alpha2.group(2).lower()[:3]]
@@ -410,7 +497,7 @@ class LayoutAwareExtractor:
             r"\b([0-9]{1,2}[-/.][0-9]{1,2}[-/.][0-9]{2,4})\b",
         ]
         for pat in date_patterns:
-            m = re.search(pat, text, re.IGNORECASE)
+            m = re.search(pat, clean, re.IGNORECASE)
             if m:
                 raw_d = m.group(1).replace("/", "-").replace(".", "-")
                 parts = raw_d.split("-")
@@ -439,6 +526,29 @@ class LayoutAwareExtractor:
         t = re.sub(r"(?<=\d)T[0-9oO\^~]+", ".00", t)
         return t
 
+    def _parse_amount_value(self, val_str: str) -> Optional[float]:
+        """Parses a currency string into float supporting both US (1,234.56) and EU (1.234,56 or 91,27) formats."""
+        if not val_str:
+            return None
+        s = val_str.strip(" $€£¥USDusdEUReurGBPgbp#")
+        try:
+            if "," in s and "." in s:
+                if s.rfind(".") > s.rfind(","):
+                    return float(s.replace(",", ""))
+                else:
+                    return float(s.replace(".", "").replace(",", "."))
+            elif "," in s:
+                parts = s.split(",")
+                if len(parts) == 2 and len(parts[1]) == 2:
+                    return float(s.replace(",", "."))
+                elif len(parts) == 2 and len(parts[1]) == 3:
+                    return float(s.replace(",", ""))
+                return float(s.replace(",", "."))
+            else:
+                return float(s)
+        except (ValueError, TypeError):
+            return None
+
     def _extract_amount_and_currency(self, text: str) -> Tuple[Optional[float], Optional[str]]:
         currency = "USD"
         if "£" in text or "GBP" in text:
@@ -451,17 +561,18 @@ class LayoutAwareExtractor:
         # Check total amount indicators anywhere in the document text
         patterns = [
             # Explicit Total phrases anywhere
-            r"(?<!sub)(?:grand\s*total|amount\s*due|total\s*amount|invoice\s*total|totals?|gross|please\s*pay\s*this\s*amount|pay\s*this\s*amount|balance\s*due|final\s*amount|net\s*to\s*pay)[:\s.]*(?:US[#$]|[$€£¥])?\s*([0-9,]+\.[0-9]{2})",
-            # Explicit Subtotal or Amount phrases anywhere
-            r"(?:amount|sub\s*total|subtotal|sub-total|net\s*worth|gross\s*worth|charge\s*total|sales\s*amount|billed\s*amount)[:\s.]*(?:US[#$]|[$€£¥])?\s*([0-9,]+\.[0-9]{2})",
+            r"(?<!sub)(?:grand\s*total|amount\s*due|total\s*amount|invoice\s*total|totals?|gross\s*worth|gross|please\s*pay\s*this\s*amount|pay\s*this\s*amount|balance\s*due|final\s*amount|net\s*to\s*pay)[:\s.]*(?:US[#$]|[$€£¥])?\s*([0-9]+(?:[.,][0-9]{3})*[.,][0-9]{2})",
             # Currency symbol prefix with decimal amount
-            r"(?:US[#$]|[$€£¥])\s*([0-9,]+\.[0-9]{2})",
-            # Formatted decimal amount (e.g. 10,170.00, 13,600.00)
+            r"(?:US[#$]|[$€£¥])\s*([0-9]+(?:[.,][0-9]{3})*[.,][0-9]{2})",
+            # Explicit Subtotal or Amount phrases anywhere
+            r"(?:amount|sub\s*total|subtotal|sub-total|net\s*worth|gross\s*worth|charge\s*total|sales\s*amount|billed\s*amount)[:\s.]*(?:US[#$]|[$€£¥])?\s*([0-9]+(?:[.,][0-9]{3})*[.,][0-9]{2})",
+            # Formatted decimal amount (e.g. 10,170.00, 13,600.00, 1.234,56)
             r"\b([0-9]{1,3}(?:,[0-9]{3})+\.[0-9]{2})\b",
+            r"\b([0-9]{1,3}(?:\.[0-9]{3})+,\s*[0-9]{2})\b",
             # Amount with ISO currency code
-            r"\b([0-9,]+\.[0-9]{2})\s*(?:USD|EUR|GBP)\b",
-            # General decimal amount
-            r"\b([0-9,]{3,}\.[0-9]{2})\b",
+            r"\b([0-9]+[.,][0-9]{2})\s*(?:USD|EUR|GBP)\b",
+            # General decimal amount (US or EU)
+            r"\b([0-9]{1,6}[.,][0-9]{2})\b",
             # Integer amounts with total or amount keyword
             r"(?:total|amount|gross|charge|sum)\s*[:\s.]*(?:US[#$]|[$€£¥])?\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{3,7})",
         ]
@@ -470,26 +581,19 @@ class LayoutAwareExtractor:
             if matches:
                 candidates = []
                 for m in matches:
-                    try:
-                        clean_m = m.replace(",", "")
-                        val = float(clean_m)
-                        if val > 0:
-                            candidates.append(val)
-                    except ValueError:
-                        pass
+                    val = self._parse_amount_value(m)
+                    if val is not None and val > 0:
+                        candidates.append(val)
                 if candidates:
                     return max(candidates), currency
 
         return None, currency
 
     def _extract_specific_amount(self, text: str, prefix_pat: str) -> Optional[float]:
-        pat = prefix_pat + r"[:\s.]*(?:US[#$]|[$€£¥])?\s*([0-9,]+\.[0-9]{2})"
+        pat = prefix_pat + r"[:\s.]*(?:US[#$]|[$€£¥])?\s*([0-9]+(?:[.,][0-9]{3})*[.,][0-9]{2})"
         m = re.search(pat, text, re.IGNORECASE)
         if m:
-            try:
-                return float(m.group(1).replace(",", ""))
-            except ValueError:
-                pass
+            return self._parse_amount_value(m.group(1))
         return None
 
     def _extract_table_rows(self, text: str, total: Optional[float]) -> List[LineItemSchema]:

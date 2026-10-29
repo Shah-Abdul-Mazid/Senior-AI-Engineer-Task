@@ -4,6 +4,7 @@ import io
 import logging
 from typing import Tuple, List, Optional
 from PIL import Image
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,11 @@ except ImportError:
     pypdf = None
 
 try:
+    import pypdfium2
+except ImportError:
+    pypdfium2 = None
+
+try:
     import pdf2image
 except ImportError:
     pdf2image = None
@@ -28,11 +34,19 @@ try:
 except ImportError:
     pytesseract = None
 
+try:
+    from rapidocr_onnxruntime import RapidOCR
+    _rapid_ocr = RapidOCR()
+except Exception as e:
+    logger.warning(f"RapidOCR initialization notice: {e}")
+    _rapid_ocr = None
+
 
 class OCRService:
     def __init__(self):
         self.tesseract_available = self._check_tesseract()
         self.pdf2image_available = pdf2image is not None
+        self.rapid_available = _rapid_ocr is not None
 
     def _check_tesseract(self) -> bool:
         if pytesseract is None:
@@ -41,7 +55,6 @@ class OCRService:
             pytesseract.get_tesseract_version()
             return True
         except Exception:
-            # Common Windows paths if not in PATH
             default_win_paths = [
                 r"C:\Program Files\Tesseract-OCR\tesseract.exe",
                 r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
@@ -53,8 +66,46 @@ class OCRService:
                     return True
             return False
 
+    def _ocr_image_content(self, img_input) -> str:
+        """Runs OCR on an image file path or PIL Image instance using RapidOCR or Tesseract."""
+        # 1. Primary Engine: RapidOCR (Neural ONNX, high precision across all formats)
+        if _rapid_ocr is not None:
+            try:
+                if isinstance(img_input, str):
+                    pil_im = Image.open(img_input).convert("RGB")
+                    img_np = np.array(pil_im)
+                elif isinstance(img_input, Image.Image):
+                    img_np = np.array(img_input.convert("RGB"))
+                else:
+                    img_np = img_input
+
+                res, _ = _rapid_ocr(img_np)
+                if res:
+                    lines = [line[1] for line in res if line and len(line) > 1 and line[1].strip()]
+                    text = "\n".join(lines).strip()
+                    if text:
+                        return text
+            except Exception as e:
+                logger.warning(f"RapidOCR engine execution error: {e}")
+
+        # 2. Secondary Engine: Tesseract OCR
+        if not self.tesseract_available:
+            self.tesseract_available = self._check_tesseract()
+
+        if self.tesseract_available and pytesseract:
+            try:
+                if isinstance(img_input, str):
+                    with Image.open(img_input) as im:
+                        return pytesseract.image_to_string(im.convert("L"), config="--psm 6").strip()
+                elif isinstance(img_input, Image.Image):
+                    return pytesseract.image_to_string(img_input.convert("L"), config="--psm 6").strip()
+            except Exception as e:
+                logger.warning(f"Tesseract OCR fallback error: {e}")
+
+        return ""
+
     def extract_from_image(self, file_path: str, original_filename: Optional[str] = None) -> str:
-        """Extract text from PNG, JPG, JPEG, TIFF images using OCR or accompanying PAGE XML."""
+        """Extract text from PNG, JPG, JPEG, TIFF images using neural OCR or accompanying PAGE XML."""
         # 1. Check if accompanying PAGE OCR XML exists (either matching stored or original filename)
         candidates = []
         base, _ = os.path.splitext(file_path)
@@ -84,20 +135,13 @@ class OCRService:
                 except Exception as e:
                     logger.warning(f"Could not parse XML {xml_p}: {e}")
 
-        # Re-check tesseract in case it was installed recently
-        if not self.tesseract_available:
-            self.tesseract_available = self._check_tesseract()
-
-        # 2. Extract with Tesseract OCR
+        # 2. Extract with Neural OCR / Tesseract
         try:
-            with Image.open(file_path) as img:
-                processed = img.convert("L")
-                if self.tesseract_available and pytesseract:
-                    text = pytesseract.image_to_string(processed, config="--psm 6")
-                    return text.strip()
-                else:
-                    logger.warning("Tesseract not available on system, falling back to basic OCR metadata.")
-                    return f"[OCR Unavailable: Tesseract engine not found. File: {os.path.basename(file_path)}]"
+            text = self._ocr_image_content(file_path)
+            if text:
+                return text
+            logger.warning(f"No OCR text extracted from {file_path}")
+            return f"[No text detected in image: {os.path.basename(file_path)}]"
         except Exception as e:
             logger.error(f"Image OCR error for {file_path}: {e}")
             raise RuntimeError(f"Failed to process image OCR: {str(e)}")
@@ -106,7 +150,7 @@ class OCRService:
         """
         Extract text from PDF.
         Attempts native digital extraction first (fast & exact).
-        If digital text is insufficient (< 50 chars/page), applies OCR via pdf2image + pytesseract.
+        If digital text is insufficient (< 40 chars/page), applies OCR via pypdfium2 / pdf2image + neural OCR.
         Handles multi-page documents (including high volume).
         Returns: (extracted_text, page_count)
         """
@@ -120,7 +164,6 @@ class OCRService:
                     total_pages = len(pdf.pages)
                     for i, page in enumerate(pdf.pages):
                         page_text = page.extract_text() or ""
-                        # If page has very little text, try extracting tables
                         if len(page_text.strip()) < 30:
                             tables = page.extract_tables()
                             if tables:
@@ -128,7 +171,7 @@ class OCRService:
                                 page_text += "\n" + table_str
                         extracted_pages.append(page_text)
             except Exception as e:
-                logger.warning(f"pdfplumber extraction failed or corrupted PDF: {e}")
+                logger.warning(f"pdfplumber extraction failed: {e}")
 
         # Attempt 2: pypdf fallback if pdfplumber didn't yield pages
         if not extracted_pages and pypdf is not None:
@@ -146,19 +189,27 @@ class OCRService:
         avg_chars_per_page = (len(combined_text) / (total_pages or 1)) if total_pages > 0 else 0
         is_scanned = total_pages > 0 and avg_chars_per_page < 40
 
-        if is_scanned and self.tesseract_available and self.pdf2image_available:
+        if is_scanned:
             logger.info(f"PDF {file_path} appears scanned (avg chars: {avg_chars_per_page}). Running OCR...")
             try:
-                # Process pages in batches to support high page count PDFs without OOM
                 ocr_pages: List[str] = []
-                images = pdf2image.convert_from_path(file_path, dpi=200, first_page=1, last_page=min(total_pages, 50))
-                for img in images:
-                    gray = img.convert("L")
-                    t = pytesseract.image_to_string(gray, config="--psm 6")
-                    ocr_pages.append(t)
-                combined_text = "\n\n--- PAGE BREAK (OCR) ---\n\n".join(ocr_pages).strip()
+                if pypdfium2 is not None:
+                    pdf_doc = pypdfium2.PdfDocument(file_path)
+                    total_pages = len(pdf_doc)
+                    for i in range(min(total_pages, 50)):
+                        page = pdf_doc.get_page(i)
+                        pil_img = page.render(scale=2.0).to_pil()
+                        page_t = self._ocr_image_content(pil_img)
+                        ocr_pages.append(page_t)
+                    combined_text = "\n\n--- PAGE BREAK (OCR) ---\n\n".join(ocr_pages).strip()
+                elif self.pdf2image_available:
+                    images = pdf2image.convert_from_path(file_path, dpi=200, first_page=1, last_page=min(total_pages, 50))
+                    for img in images:
+                        page_t = self._ocr_image_content(img)
+                        ocr_pages.append(page_t)
+                    combined_text = "\n\n--- PAGE BREAK (OCR) ---\n\n".join(ocr_pages).strip()
             except Exception as e:
-                logger.warning(f"pdf2image/pytesseract OCR fallback failed: {e}")
+                logger.warning(f"PDF OCR failed: {e}")
 
         return combined_text, total_pages
 
