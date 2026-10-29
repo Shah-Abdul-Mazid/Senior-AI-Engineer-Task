@@ -5,6 +5,7 @@ from app.core.config import settings
 from app.api.v1.api import api_router
 from app.ml.model import ml_model
 from app.core.database import init_db
+from app.core.mongodb import mongo_manager
 from app.storage.file_store import ensure_upload_dir
 import logging
 
@@ -18,12 +19,21 @@ async def lifespan(app: FastAPI):
     ensure_upload_dir()
     ml_model.load()
 
-    # Attempt to initialize database tables
+    # Attempt to initialize database tables (PostgreSQL & MongoDB)
     try:
         await init_db()
-        print("[OK] Database tables and pgvector extension initialized.")
+        print("[OK] PostgreSQL database tables and pgvector extension initialized.")
     except Exception as e:
         logger.warning(f"Could not connect to PostgreSQL database on startup: {e}. Running in memory-safe mode.")
+
+    try:
+        mongo_connected = await mongo_manager.connect()
+        if mongo_connected:
+            print("[OK] MongoDB Atlas initialized with text & compound search indexes.")
+        else:
+            print("[INFO] MongoDB not connected, proceeding with local relational storage.")
+    except Exception as e:
+        logger.warning(f"Could not connect to MongoDB on startup: {e}")
 
     print(f"[OK] AI LLM & Extraction Engine Ready: '{settings.LLM_MODEL}'\n")
     yield

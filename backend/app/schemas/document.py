@@ -1,6 +1,6 @@
 """Pydantic schemas for Document Intelligence API."""
 from pydantic import BaseModel, Field, field_validator
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 from datetime import datetime, date
 from uuid import UUID
 from enum import Enum
@@ -193,7 +193,7 @@ class SearchRequest(BaseModel):
 
 
 class SearchResultItem(BaseModel):
-    document_id: UUID
+    document_id: Union[UUID, str]
     filename: str
     file_type: str
     status: DocumentStatus

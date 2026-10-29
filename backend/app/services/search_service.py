@@ -2,6 +2,7 @@
 import time
 import math
 import logging
+from datetime import datetime
 from typing import List, Dict, Any, Optional
 from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,6 +12,7 @@ from app.core.config import settings
 from app.models.document import Document, DocumentStatus
 from app.models.invoice import Invoice
 from app.schemas.document import SearchRequest, SearchResponse, SearchResultItem
+from app.core.mongodb import mongo_manager
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +54,61 @@ class SearchService:
         search_type = payload.search_type
         query = payload.query.strip()
 
+        # 1. Try MongoDB Search First if connected
+        if mongo_manager.is_connected:
+            try:
+                query_embedding = None
+                if search_type in ["semantic", "hybrid"]:
+                    query_embedding = await self.get_embedding(query)
+
+                status_val = payload.status_filter.value if hasattr(payload.status_filter, "value") else (str(payload.status_filter) if payload.status_filter else None)
+                file_type_val = payload.file_type_filter.value if hasattr(payload.file_type_filter, "value") else (str(payload.file_type_filter) if payload.file_type_filter else None)
+
+                mongo_hits = await mongo_manager.search(
+                    query=query,
+                    search_type=search_type,
+                    query_embedding=query_embedding,
+                    status_filter=status_val,
+                    file_type_filter=file_type_val,
+                    date_from=str(payload.date_from) if payload.date_from else None,
+                    date_to=str(payload.date_to) if payload.date_to else None,
+                    limit=payload.top_k,
+                )
+
+                if mongo_hits:
+                    results = []
+                    for h in mongo_hits:
+                        try:
+                            doc_uuid = UUID(str(h["document_id"]))
+                        except Exception:
+                            doc_uuid = h["document_id"]
+
+                        results.append(
+                            SearchResultItem(
+                                document_id=doc_uuid,
+                                filename=h.get("filename") or "document",
+                                file_type=h.get("file_type") or "pdf",
+                                status=h.get("status") or "completed",
+                                invoice_number=h.get("invoice_number"),
+                                supplier_name=h.get("supplier_name"),
+                                total=h.get("total"),
+                                currency=h.get("currency", "USD"),
+                                relevance_score=h.get("score", 1.0),
+                                created_at=datetime.utcnow(),
+                            )
+                        )
+                    latency_ms = (time.perf_counter() - start_time) * 1000.0
+                    return SearchResponse(
+                        query=query,
+                        search_type=search_type,
+                        results=results,
+                        total_results=len(results),
+                        latency_ms=round(latency_ms, 2),
+                    )
+            except Exception as e:
+                logger.warning(f"MongoDB search encountered an issue ({e}), falling back to relational search.")
+
+        # 2. Relational Search (PostgreSQL + pgvector fallback)
         # Build base query joining Document and Invoice
         stmt = (
             select(Document, Invoice)

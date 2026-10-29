@@ -37,6 +37,7 @@ from app.services.batch_dataset import batch_dataset_service
 from app.ai.extractor import ai_extractor
 from app.services.validation_service import validation_service
 from app.services.search_service import search_service
+from app.core.mongodb import mongo_manager
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,27 @@ class DocumentService:
         db.add(job)
         await db.commit()
         await db.refresh(doc)
+
+        # Sync initial record to MongoDB Atlas
+        try:
+            await mongo_manager.save_document({
+                "document_id": str(doc.id),
+                "filename": doc.filename,
+                "original_filename": doc.original_filename,
+                "file_type": ext,
+                "file_path": file_path,
+                "file_size_bytes": float(file_size),
+                "status": "pending",
+                "created_at": datetime.utcnow(),
+            })
+            await mongo_manager.record_processing_history(
+                document_id=str(doc.id),
+                status="pending",
+                stage="queued",
+                attempt_count=0,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to sync initial ingestion to MongoDB: {e}")
 
         return DocumentUploadResponse(
             document_id=doc.id,
@@ -304,6 +326,82 @@ class DocumentService:
                 job.finished_at = datetime.utcnow()
                 job.duration_seconds = round(time.perf_counter() - start_t, 2)
                 await db.commit()
+
+                # Sync full processed document, structured results, validation errors & history to MongoDB
+                try:
+                    await mongo_manager.save_document({
+                        "document_id": str(doc.id),
+                        "filename": doc.filename,
+                        "original_filename": doc.original_filename,
+                        "file_type": ext,
+                        "file_path": doc.file_path,
+                        "file_size_bytes": doc.file_size_bytes,
+                        "page_count": doc.page_count,
+                        "sheet_count": doc.sheet_count,
+                        "raw_text": doc.raw_text,
+                        "status": doc.status.value if hasattr(doc.status, "value") else str(doc.status),
+                        "text_embedding": doc.text_embedding,
+                        "processed_at": doc.processed_at,
+                    })
+
+                    line_items_data = [
+                        {
+                            "description": li.description,
+                            "quantity": li.quantity,
+                            "unit": li.unit,
+                            "unit_price": li.unit_price,
+                            "amount": li.amount,
+                            "tax_rate": li.tax_rate,
+                            "product_code": li.product_code,
+                        }
+                        for li in extracted_data.line_items
+                    ]
+                    await mongo_manager.save_invoice({
+                        "document_id": str(doc.id),
+                        "invoice_number": extracted_data.invoice_number,
+                        "purchase_order_number": extracted_data.purchase_order_number,
+                        "invoice_date": str(extracted_data.invoice_date) if extracted_data.invoice_date else None,
+                        "due_date": str(extracted_data.due_date) if extracted_data.due_date else None,
+                        "supplier_name": extracted_data.supplier_name,
+                        "supplier_address": extracted_data.supplier_address,
+                        "customer_name": extracted_data.customer_name,
+                        "customer_address": extracted_data.customer_address,
+                        "currency": extracted_data.currency,
+                        "subtotal": extracted_data.subtotal,
+                        "tax": extracted_data.tax,
+                        "tax_rate": extracted_data.tax_rate,
+                        "discount": extracted_data.discount,
+                        "total": extracted_data.total,
+                        "payment_terms": extracted_data.payment_terms,
+                        "confidence_score": extracted_data.confidence_score,
+                        "extraction_notes": extracted_data.extraction_notes,
+                        "line_items": line_items_data,
+                    })
+
+                    errors_data = [
+                        {
+                            "error_type": issue.error_type,
+                            "severity": issue.severity.value if hasattr(issue.severity, "value") else str(issue.severity),
+                            "field_name": issue.field_name,
+                            "message": issue.message,
+                            "expected_value": issue.expected_value,
+                            "actual_value": issue.actual_value,
+                            "resolved": False,
+                        }
+                        for issue in all_issues
+                    ]
+                    await mongo_manager.save_validation_errors(str(doc.id), errors_data)
+
+                    await mongo_manager.record_processing_history(
+                        document_id=str(doc.id),
+                        status=doc.status.value if hasattr(doc.status, "value") else str(doc.status),
+                        stage="completed",
+                        attempt_count=job.attempt_count or 1,
+                        duration_ms=round((time.perf_counter() - start_t) * 1000, 2),
+                    )
+                except Exception as me:
+                    logger.warning(f"Failed to sync processed results to MongoDB: {me}")
+
                 logger.info(f"Pipeline finished for document {document_id} with status {doc.status}")
 
             except Exception as e:
@@ -445,6 +543,31 @@ class DocumentService:
                 doc.status = DocumentStatus.COMPLETED
 
         await db.commit()
+
+        # Sync corrections to MongoDB
+        try:
+            db_mongo = mongo_manager.get_db()
+            if db_mongo is not None:
+                doc_id_str = str(document_id)
+                update_fields = {}
+                for f, v in payload.corrections.items():
+                    update_fields[f] = v
+                update_fields["is_corrected"] = True
+                update_fields["corrections"] = payload.corrections
+                update_fields["corrected_at"] = datetime.utcnow()
+                await db_mongo.invoices.update_one(
+                    {"document_id": doc_id_str},
+                    {"$set": update_fields}
+                )
+                # Mark errors resolved in MongoDB
+                for f in payload.corrections.keys():
+                    await db_mongo.validation_errors.update_many(
+                        {"document_id": doc_id_str, "field_name": f},
+                        {"$set": {"resolved": True}}
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to sync corrections to MongoDB: {e}")
+
         return await self.get_document_result(document_id, db)
 
     async def delete_documents(self, db: AsyncSession, status_filter: Optional[str] = None) -> int:
@@ -462,6 +585,22 @@ class DocumentService:
         for d in docs_to_delete:
             await db.delete(d)
         await db.commit()
+
+        # Delete from MongoDB
+        try:
+            db_mongo = mongo_manager.get_db()
+            if db_mongo is not None:
+                if status_filter and status_filter.lower() != "all":
+                    doc_ids = [str(d.id) for d in docs_to_delete]
+                    await db_mongo.documents.delete_many({"document_id": {"$in": doc_ids}})
+                    await db_mongo.invoices.delete_many({"document_id": {"$in": doc_ids}})
+                    await db_mongo.validation_errors.delete_many({"document_id": {"$in": doc_ids}})
+                    await db_mongo.processing_history.delete_many({"document_id": {"$in": doc_ids}})
+                else:
+                    await mongo_manager.clear_all()
+        except Exception as e:
+            logger.warning(f"Failed to clear MongoDB records: {e}")
+
         logger.info(f"Cleared {count} documents (filter: {status_filter})")
         return count
 
@@ -472,6 +611,19 @@ class DocumentService:
             return False
         await db.delete(doc)
         await db.commit()
+
+        # Delete from MongoDB
+        try:
+            db_mongo = mongo_manager.get_db()
+            if db_mongo is not None:
+                doc_id_str = str(document_id)
+                await db_mongo.documents.delete_one({"document_id": doc_id_str})
+                await db_mongo.invoices.delete_one({"document_id": doc_id_str})
+                await db_mongo.validation_errors.delete_many({"document_id": doc_id_str})
+                await db_mongo.processing_history.delete_many({"document_id": doc_id_str})
+        except Exception as e:
+            logger.warning(f"Failed to delete document {document_id} from MongoDB: {e}")
+
         logger.info(f"Deleted document {document_id}")
         return True
 
