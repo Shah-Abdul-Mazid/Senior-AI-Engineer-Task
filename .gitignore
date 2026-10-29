@@ -33,3 +33,5 @@ $RECYCLE.BIN/
 
 # Temporary uploads (large datasets should be tracked or stored separately)
 # uploads/
+uploads/
+*.code-workspace
