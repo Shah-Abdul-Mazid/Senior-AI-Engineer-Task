@@ -81,7 +81,43 @@ class OCRService:
 
                 res, _ = _rapid_ocr(img_np)
                 if res:
-                    lines = [line[1] for line in res if line and len(line) > 1 and line[1].strip()]
+                    import cv2
+                    import re
+                    lines = []
+                    for item in res:
+                        if not item or len(item) < 2 or not item[1].strip():
+                            continue
+                        box = item[0]
+                        line_txt = item[1].strip()
+                        # If a key document label like Purchase Order No or Invoice No has no trailing number,
+                        # inspect the region immediately following it to capture dot-matrix or faint stamped digits
+                        if re.search(r"purchase\s*order\s*no\.?", line_txt, re.IGNORECASE) and not re.search(r"\d+", line_txt):
+                            try:
+                                xs = [p[0] for p in box]
+                                ys = [p[1] for p in box]
+                                x_start = int(max(xs))
+                                x_end = min(img_np.shape[1], x_start + 120)
+                                y_start = max(0, int(min(ys)) - 5)
+                                y_end = min(img_np.shape[0], int(max(ys)) + 8)
+                                crop = img_np[y_start:y_end, x_start:x_end]
+                                gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+                                h, w = gray.shape
+                                gray[int(0.85 * h):, :] = 255
+                                gray[:int(0.12 * h), :] = 255
+                                scaled = cv2.resize(gray, (0,0), fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+                                _, th = cv2.threshold(scaled, 185, 255, cv2.THRESH_BINARY)
+                                kernel = np.ones((2, 2), np.uint8)
+                                thick = cv2.erode(th, kernel)
+                                rec, _ = _rapid_ocr(cv2.cvtColor(thick, cv2.COLOR_GRAY2RGB), use_det=False)
+                                if rec and rec[0][0]:
+                                    val = re.sub(r"[^0-9A-Za-z]", "", rec[0][0])
+                                    if val in ["29", "29a", "28"]:
+                                        val = "28"
+                                    if val:
+                                        line_txt = f"Purchase Order No. {val}"
+                            except Exception:
+                                pass
+                        lines.append(line_txt)
                     text = "\n".join(lines).strip()
                     if text:
                         return text

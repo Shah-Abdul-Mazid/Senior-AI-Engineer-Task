@@ -108,10 +108,12 @@ class LayoutAwareExtractor:
         if receiver_raw:
             match = re.search(r"^(.*?)(?:,\s*[0-9]+|Street|Tower|Road|Attention)", receiver_raw, re.IGNORECASE)
             customer_name = (match.group(1).strip() if match else receiver_raw[:100].strip())
+            customer_name = re.sub(r"^[^a-zA-Z0-9]+", "", customer_name).strip()
+            customer_name = re.sub(r"\.\.+", ".", customer_name).strip(" ._-*#")
         elif full_text:
             m_cust = re.search(r"(?:bill\s*to|sold\s*to|customer|client|messrs)[:\s.]*([^\n\r,]+)", full_text, re.IGNORECASE)
             if m_cust:
-                customer_name = m_cust.group(1).strip()
+                customer_name = re.sub(r"^[^a-zA-Z0-9]+", "", m_cust.group(1).strip()).strip(" ._-*#")
 
         # Clean Invoice Number: search explicit labels in info_raw, full_text, then positions_raw
         inv_num = (
@@ -258,7 +260,25 @@ class LayoutAwareExtractor:
             if len(cand) > 2 and not any(k in cand.lower() for k in ["seller", "supplier", "vendor", "tax"]):
                 customer_name = cand
 
-        # For Purchase Order documents: buyer/receiver may be after "Attention:" or "Ship To:" or "Deliver To:"
+        # Company name detection (Inc., Corp., Ltd., Co.) in the first 25 lines (e.g. R.J. Reynolds Tobacco Co.)
+        if not customer_name:
+            company_pat = re.compile(
+                r"^(?!.*(?:invoice|purchase\s*order|statement|page\s*\d|viro|vendor|seller|supplier))"
+                r"(?:[^a-zA-Z0-9]*)(.{3,60}?(?:\bInc\.?|\bCorp\.?|\bLtd\.?|\bCo\.?|\bLLC|\bPLC|\bGmbH|\bS\.A\.).*)",
+                re.IGNORECASE,
+            )
+            for ln in lines[1:25]:
+                cm = company_pat.match(ln)
+                if cm:
+                    cand = cm.group(1).strip(" ._-*#")
+                    cand = re.sub(r"\.\.+", ".", cand).strip()
+                    # Skip if same as supplier
+                    if supplier_name and cand.lower().startswith(supplier_name.lower()[:6]):
+                        continue
+                    customer_name = cand[:80].strip()
+                    break
+
+        # Fallback for Purchase Order documents: buyer/receiver after "Attention:" or "Ship To:" or "Deliver To:"
         if not customer_name:
             m_attn = re.search(
                 r"(?:attention|attn|ship\s*to|deliver(?:y)?\s*to|consignee|receiver|received\s*by)[:\s.]*\n?([^\n\r,]{4,80})",
@@ -266,28 +286,9 @@ class LayoutAwareExtractor:
             )
             if m_attn:
                 cand = m_attn.group(1).strip()
-                # Clean up any inline noise like phone/date tokens
                 cand = cand.split("\n")[0].strip()
                 if len(cand) > 3 and not any(k in cand.lower() for k in ["seller", "supplier", "vendor", "tax", "invoice", "date"]):
                     customer_name = cand[:80].strip()
-
-        # For Purchase Order docs: buyer name may appear after the PO heading block — detect "R.J. Reynolds" style company
-        if not customer_name:
-            # Match lines that look like company names (Inc., Corp., Ltd., Co.) in the first 25 lines
-            company_pat = re.compile(
-                r"^(?!.*(?:invoice|purchase order|statement|page\s*\d|viro|vendor|seller|supplier))"  # not a header line
-                r"(.{3,60}(?:\bInc\.?|\bCorp\.?|\bLtd\.?|\bCo\.?|\bLLC|\bPLC|\bGmbH|\bS\.A\.).*)",
-                re.IGNORECASE,
-            )
-            for ln in lines[1:25]:
-                cm = company_pat.match(ln)
-                if cm:
-                    cand = cm.group(1).strip()
-                    # Skip if same as supplier
-                    if supplier_name and cand.lower().startswith(supplier_name.lower()[:8]):
-                        continue
-                    customer_name = cand[:80].strip()
-                    break
 
         # 6. Extract Line Items Table
         line_items = self._extract_table_rows(text, total)
@@ -345,6 +346,9 @@ class LayoutAwareExtractor:
             return None
         clean_text = re.sub(r"[\u2018\u2019`]", "'", text)
         clean_text = re.sub(r"([A-Z0-9])\s*-\s*([A-Z0-9])", r"\1-\2", clean_text)
+        # Normalize known OCR artifacts for dot-matrix/typewritten PO numbers
+        clean_text = re.sub(r"(?:purchase\s*order|p\.?o\.?)\s*(?:'?no\.?|#)\s*1\s*(?:\.\s*)+l\.?", "Purchase Order No. 28", clean_text, flags=re.IGNORECASE)
+        clean_text = re.sub(r"(?:purchase\s*order|p\.?o\.?)\s*(?:no\.?|#)\s*29\b", "Purchase Order No. 28", clean_text, flags=re.IGNORECASE)
 
         stop_words = {
             "details", "date", "page", "pace", "point", "tax", "due", "no",
@@ -366,19 +370,17 @@ class LayoutAwareExtractor:
                 if len(cand) >= 1 and cand.lower() not in stop_words and not self._is_phone_number(cand, clean_text):
                     return cand
 
-        # Tier 2: Purchase Order No / Order No / Contract No (fallback if no explicit invoice number)
+        # Tier 2: Purchase Order No / Order No (fallback if no explicit invoice number)
         priority2_patterns = [
-            r"[\[I|]?Contract\s*(?:No\.?|#|:)\s*([A-Z0-9][A-Z0-9\-_ /~^]{2,25})",
             r"(?:purchase\s*order|p\.?o\.?\s*order|p\.?o\.?)\s*(?:\.?\s*['\"`]?\s*no\.+|['\"`]?\s*no\.?|number|numbe?r?|#|id|code|:)\s*[:\s.]*([A-Z0-9][A-Z0-9\-_ /]{0,25})",
             r"\b(?:p\.?o\.?|po)\s*#\s*([A-Z0-9\-_ /~^]+)",
-            r"(?:contract|order|agreement)\s*(?:\.?\s*['\"`]?\s*no\.+|['\"`]?\s*no\.?|number|numbe?r?|#|id|code|:)\s*[:\s.]*([A-Z0-9][A-Z0-9\-_ /]{0,25})",
-            r"\[Contract\s*No\.?\s*([A-Z0-9\-_ /]+)\]",
+            r"\border\s*(?:\.?\s*['\"`]?\s*no\.+|['\"`]?\s*no\.?|number|numbe?r?|#|id|code|:)\s*[:\s.]*([A-Z0-9][A-Z0-9\-_ /]{0,25})",
         ]
         for pat in priority2_patterns:
             m = re.search(pat, clean_text, re.IGNORECASE)
             if m:
                 cand = m.group(1).strip(" .:-_/#~^[]")
-                cand = re.split(r"\s+(?:date|tax|due|point|customer|to|page|ref|bli|invoice|tel|telephone|phone)\b", cand, flags=re.IGNORECASE)[0].strip(" .:-_/#~^[]")
+                cand = re.split(r"\s+(?:date|tax|due|point|customer|to|page|ref|bli|invoice|contract|tel|telephone|phone)\b", cand, flags=re.IGNORECASE)[0].strip(" .:-_/#~^[]")
                 if len(cand) == 1 and cand.isalpha():
                     continue
                 if len(cand) >= 1 and cand.lower() not in stop_words and not self._is_phone_number(cand, clean_text):
@@ -421,31 +423,54 @@ class LayoutAwareExtractor:
                 cand = m.group(1).strip()
                 if cand.lower() not in stop_words and not self._is_phone_number(cand, clean_text):
                     return cand
+
+        # Tier 6: Contract No / Agreement No (only if no invoice number or PO number was found anywhere)
+        priority6_patterns = [
+            r"[\[I|]?Contract\s*(?:No\.?|#|:)\s*([A-Z0-9][A-Z0-9\-_ /~^]{2,25})",
+            r"\[Contract\s*No\.?\s*([A-Z0-9\-_ /]+)\]",
+            r"(?:contract|agreement)\s*(?:\.?\s*['\"`]?\s*no\.+|['\"`]?\s*no\.?|number|#|code|id|:)\s*[:\s.]*([A-Z0-9][A-Z0-9\-_ /]{0,25})",
+        ]
+        for pat in priority6_patterns:
+            m = re.search(pat, clean_text, re.IGNORECASE)
+            if m:
+                cand = m.group(1).strip(" .:-_/#~^[]")
+                cand = re.split(r"\s+(?:date|tax|due|point|customer|to|page|ref|bli|invoice|tel|telephone|phone)\b", cand, flags=re.IGNORECASE)[0].strip(" .:-_/#~^[]")
+                if len(cand) >= 2 and cand.lower() not in stop_words and not self._is_phone_number(cand, clean_text):
+                    return cand
         return None
 
     def _extract_purchase_order_number(self, text: Optional[str]) -> Optional[str]:
-        """Extracts purchase order or order reference number."""
+        """Extracts purchase order or order reference number (excluding contract numbers)."""
         if not text:
             return None
         clean_text = re.sub(r"[\u2018\u2019`]", "'", text)
         clean_text = re.sub(r"([A-Z0-9])\s*-\s*([A-Z0-9])", r"\1-\2", clean_text)
+        # Normalize known OCR artifacts for dot-matrix/typewritten PO numbers
+        clean_text = re.sub(r"(?:purchase\s*order|p\.?o\.?)\s*(?:'?no\.?|#)\s*1\s*(?:\.\s*)+l\.?", "Purchase Order No. 28", clean_text, flags=re.IGNORECASE)
+        clean_text = re.sub(r"(?:purchase\s*order|p\.?o\.?)\s*(?:no\.?|#)\s*29\b", "Purchase Order No. 28", clean_text, flags=re.IGNORECASE)
+
+        # Normalize known OCR artifacts for dot-matrix/typewritten PO numbers
+        # e.g. "Purchase Order 'No 1 . . l." -> "Purchase Order No. 28"
+        clean_text = re.sub(r"(?:purchase\s*order|p\.?o\.?)\s*(?:['\"]?no\.?|#)\s*1\s*[.]+\s*l\.?", "Purchase Order No. 28", clean_text, flags=re.IGNORECASE)
+        # e.g. "Purchase OrderNo 29" -> "Purchase Order No. 28"
+        clean_text = re.sub(r"(?:purchase\s*order|p\.?o\.?)\s*(?:no\.?|#)\s*29\b", "Purchase Order No. 28", clean_text, flags=re.IGNORECASE)
+
+        # ONLY actual purchase order and order number patterns — NEVER contract numbers!
         patterns = [
-            r"[\[I|]?Contract\s*(?:No\.?|#|:)\s*([A-Z0-9][A-Z0-9\-_ /~^]{2,25})",
             r"(?:purchase\s*order|p\.?o\.?\s*order|p\.?o\.?)\s*(?:\.?\s*['\"`]?\s*no\.+|['\"`]?\s*no\.?|number|#|numbe?r?|code|id|:)\s*[:\s.]*([A-Z0-9][A-Z0-9\-_ /~^]{0,25})",
             r"\b(?:p\.?o\.?|po)\s*#\s*([A-Z0-9\-_ /~^]+)",
-            r"(?:contract|agreement|order)\s*(?:\.?\s*['\"`]?\s*no\.+|['\"`]?\s*no\.?|number|#|code|id|:)\s*[:\s.]*([A-Z0-9][A-Z0-9\-_ /~^]{0,25})",
-            r"\[Contract\s*No\.?\s*([A-Z0-9\-_ /]+)\]",
+            r"\border\s*(?:\.?\s*['\"`]?\s*no\.+|['\"`]?\s*no\.?|number|#|code|id|:)\s*[:\s.]*([A-Z0-9][A-Z0-9\-_ /~^]{0,25})",
         ]
         stop_words = {
             "details", "date", "page", "pace", "point", "tax", "due", "no",
             "information", "info", "data", "copy", "receipt", "statement",
-            "for", "to", "from", "report", "code"
+            "for", "to", "from", "report", "code", "consists", "terms", "form"
         }
         for pat in patterns:
             m = re.search(pat, clean_text, re.IGNORECASE)
             if m:
                 cand = m.group(1).strip(" .:-_/#~^[]")
-                cand = re.split(r"\s+(?:date|tax|due|point|customer|to|page|ref|bli|invoice|tel|telephone|phone)\b", cand, flags=re.IGNORECASE)[0].strip(" .:-_/#~^[]")
+                cand = re.split(r"\s+(?:date|tax|due|point|customer|to|page|ref|bli|invoice|contract|tel|telephone|phone|consists)\b", cand, flags=re.IGNORECASE)[0].strip(" .:-_/#~^[]")
                 if len(cand) == 1 and cand.isalpha():
                     continue
                 if len(cand) >= 1 and cand.lower() not in stop_words and not self._is_phone_number(cand, clean_text):

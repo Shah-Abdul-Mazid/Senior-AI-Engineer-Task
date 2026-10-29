@@ -47,6 +47,7 @@ interface InvoiceData {
   id?: string;
   document_id?: string;
   invoice_number: string | null;
+  purchase_order_number?: string | null;
   invoice_date: string | null;
   supplier_name: string | null;
   customer_name: string | null;
@@ -118,7 +119,7 @@ interface DocumentStudioProps {
 // ─── Helper ──────────────────────────────────────────────────────────────────
 
 const BLANK_INVOICE: InvoiceData = {
-  invoice_number: null, invoice_date: null, supplier_name: null,
+  invoice_number: null, purchase_order_number: null, invoice_date: null, supplier_name: null,
   customer_name: null, currency: 'USD', subtotal: null, tax: null,
   total: null, confidence_score: 0, line_items: [],
 };
@@ -227,6 +228,7 @@ export default function DocumentIntelligenceStudio({ onQueueCountChange }: Docum
           id: result.invoice.id,
           document_id: docId,
           invoice_number: result.invoice.invoice_number,
+          purchase_order_number: result.invoice.purchase_order_number,
           invoice_date: result.invoice.invoice_date,
           supplier_name: result.invoice.supplier_name,
           customer_name: result.invoice.customer_name,
@@ -363,6 +365,7 @@ export default function DocumentIntelligenceStudio({ onQueueCountChange }: Docum
         corrections: {
           supplier_name: currentInvoice.supplier_name,
           invoice_number: currentInvoice.invoice_number,
+          purchase_order_number: currentInvoice.purchase_order_number,
           subtotal: currentInvoice.subtotal,
           tax: currentInvoice.tax,
           total: currentInvoice.total,
@@ -709,6 +712,11 @@ export default function DocumentIntelligenceStudio({ onQueueCountChange }: Docum
                         <span className="text-[9px] font-mono font-bold bg-indigo-500/20 text-indigo-300 px-2 py-0.5 rounded border border-indigo-500/40">
                           {currentInvoice.invoice_number || 'NO INV #'}
                         </span>
+                        {currentInvoice.purchase_order_number && (
+                          <p className="text-[9px] text-cyan-400 font-mono mt-0.5">
+                            PO: {currentInvoice.purchase_order_number}
+                          </p>
+                        )}
                         <p className="text-[9px] text-gray-500 mt-1">Date: {currentInvoice.invoice_date || '—'}</p>
                       </div>
                     </div>
@@ -830,6 +838,7 @@ export default function DocumentIntelligenceStudio({ onQueueCountChange }: Docum
                   {[
                     { label: 'Supplier / Vendor', key: 'supplier_name' as const, mono: false },
                     { label: 'Invoice Number', key: 'invoice_number' as const, mono: true },
+                    { label: 'Purchase Order (PO) #', key: 'purchase_order_number' as const, mono: true },
                     { label: 'Invoice Date', key: 'invoice_date' as const, mono: true },
                     { label: 'Customer / Bill-to', key: 'customer_name' as const, mono: false },
                     { label: 'Currency', key: 'currency' as const, mono: true },
